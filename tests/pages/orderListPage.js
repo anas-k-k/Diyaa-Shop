@@ -65,41 +65,72 @@ function readPincodesFromExcel(absPath) {
 }
 
 // Cache for Excel lookups to avoid re-reading files repeatedly
+// Dynamic cache that can store any carrier name as key
 const _excelCache = {
-  DTDC: null, // Set or null
-  Delhivery: null,
-  lastLoaded: 0,
+  carriers: new Map(), // Map<carrierName, Set<pincode>>
+  lastLoaded: new Map(), // Map<carrierName, timestamp>
   // reload interval in ms (optional) - set to 60s to allow occasional refresh
   reloadInterval: 60 * 1000,
 };
 
-function loadExcelCaches() {
+// Load Excel cache for a specific carrier
+function loadExcelCacheForCarrier(carrierName) {
+  if (!carrierName) return null;
+
   const now = Date.now();
+  const normalizedCarrier = carrierName.trim();
+
+  // Check if we have a recent cache for this carrier
+  const lastLoadTime = _excelCache.lastLoaded.get(normalizedCarrier);
   if (
-    _excelCache.lastLoaded &&
-    now - _excelCache.lastLoaded < _excelCache.reloadInterval &&
-    _excelCache.DTDC !== null &&
-    _excelCache.Delhivery !== null
+    lastLoadTime &&
+    now - lastLoadTime < _excelCache.reloadInterval &&
+    _excelCache.carriers.has(normalizedCarrier)
   ) {
-    return;
+    return _excelCache.carriers.get(normalizedCarrier);
   }
+
+  // Load fresh data for this carrier
   const dataDir = path.join(process.cwd(), "data");
-  _excelCache.DTDC = readPincodesFromExcel(path.join(dataDir, "DTDC.xlsx"));
-  _excelCache.Delhivery = readPincodesFromExcel(
-    path.join(dataDir, "Delhivery.xlsx")
-  );
-  // Delhivery cache is a Set; use .add to insert a value (avoid .push which is for arrays)
-  try {
-    if (
-      _excelCache.Delhivery &&
-      typeof _excelCache.Delhivery.add === "function"
-    ) {
-      // _excelCache.Delhivery.add("682021"); // manually add known pincode
+  const carrierFileName = `${normalizedCarrier}.xlsx`;
+  const carrierFilePath = path.join(dataDir, carrierFileName);
+
+  const pincodeSet = readPincodesFromExcel(carrierFilePath);
+
+  // Cache the result
+  _excelCache.carriers.set(normalizedCarrier, pincodeSet);
+  _excelCache.lastLoaded.set(normalizedCarrier, now);
+
+  return pincodeSet;
+}
+
+// Legacy function for backward compatibility - now loads all known carriers
+function loadExcelCaches() {
+  // Load commonly used carriers (DTDC, Delhivery) for backward compatibility
+  const commonCarriers = ["DTDC", "Delhivery"];
+  commonCarriers.forEach((carrier) => {
+    loadExcelCacheForCarrier(carrier);
+  });
+}
+
+// Get cached pincode data for a specific carrier
+function getCarrierPincodes(carrierName) {
+  if (!carrierName) return null;
+  const normalizedCarrier = carrierName.trim();
+
+  // Try to get from cache first
+  if (_excelCache.carriers.has(normalizedCarrier)) {
+    const lastLoadTime = _excelCache.lastLoaded.get(normalizedCarrier);
+    const now = Date.now();
+
+    // If cache is still valid, return it
+    if (lastLoadTime && now - lastLoadTime < _excelCache.reloadInterval) {
+      return _excelCache.carriers.get(normalizedCarrier);
     }
-  } catch (e) {
-    // ignore any errors when adding to cache
   }
-  _excelCache.lastLoaded = now;
+
+  // Cache miss or expired, load fresh data
+  return loadExcelCacheForCarrier(normalizedCarrier);
 }
 
 // runtime base URL (strip trailing slash)
@@ -240,7 +271,10 @@ class OrderListPage {
   // Open a new tab for the order sync page, click Sync with Shiprocket,
   // interact with the modal (select courier DTDC, choose radio, wait), then close.
   // This method is defensive and will return quickly if elements are not found.
-  async syncShiprocketForOrder(orderId, { waitMs = 2500 } = {}) {
+  async syncShiprocketForOrder(
+    orderId,
+    { waitMs = 2500, pincode = null } = {}
+  ) {
     if (!orderId) return { synced: false, reason: "no-order-id" };
 
     const targetUrl = `${BASE_URL}/inventory/order/${orderId}`;
@@ -283,7 +317,55 @@ class OrderListPage {
         let selected = false;
         try {
           // Helper to try selecting an option by visible text (case-insensitive)
-          const trySelectByText = async (text) => {
+          // with pincode validation against Excel files
+          const trySelectByText = async (text, pincode = null) => {
+            // Step 1: Check if there is an Excel file with carrier name in data folder
+            if (pincode && text) {
+              try {
+                const dataDir = path.join(process.cwd(), "data");
+                const carrierFileName = `${text.trim()}.xlsx`;
+                const carrierFilePath = path.join(dataDir, carrierFileName);
+
+                // Step 2: Check if Excel file exists
+                if (fs.existsSync(carrierFilePath)) {
+                  console.log(
+                    `Found Excel file for carrier: ${text} at ${carrierFilePath}`
+                  );
+
+                  // Step 3: Load Excel cache for this specific carrier
+                  const carrierPincodes = loadExcelCacheForCarrier(text.trim());
+
+                  // Step 4: Check if pincode is present in the Excel file
+                  if (
+                    carrierPincodes &&
+                    carrierPincodes.has(String(pincode).trim())
+                  ) {
+                    console.log(
+                      `Pincode ${pincode} found in ${text} Excel file. Proceeding with carrier selection.`
+                    );
+                    // Proceed with carrier selection as pincode is valid
+                  } else {
+                    // Step 5: Pincode not found, don't select carrier and close popup
+                    console.log(
+                      `Pincode ${pincode} NOT found in ${text} Excel file. Skipping carrier selection.`
+                    );
+                    return false; // Don't proceed with selection
+                  }
+                } else {
+                  console.log(
+                    `No Excel file found for carrier: ${text}. Proceeding with default behavior.`
+                  );
+                  // Step 2: File doesn't exist, proceed as current code (no validation)
+                }
+              } catch (e) {
+                console.warn(
+                  `Error checking Excel file for carrier ${text}:`,
+                  e.message
+                );
+                // On error, proceed with default behavior
+              }
+            }
+
             const selCandidates = [
               `#select2-logistics-results li.select2-results__option`,
               `ul.select2-results__options li.select2-results__option`,
@@ -344,13 +426,14 @@ class OrderListPage {
 
           if (carrierOverride) {
             // Use the exact CARRIER_OVERRIDE value from .env to select from dropdown
-            selected = await trySelectByText(carrierOverride);
+            // Pass the pincode from the function parameters for validation
+            selected = await trySelectByText(carrierOverride, pincode);
             if (selected) {
               selectedCarrier = carrierOverride;
             } else {
-              // carrier not found in dropdown - log warning
+              // carrier not found in dropdown or pincode validation failed - log warning
               console.warn(
-                `Carrier '${carrierOverride}' not found in dropdown. No carrier selected.`
+                `Carrier '${carrierOverride}' not selected. Either not found in dropdown or pincode validation failed.`
               );
             }
           }
@@ -952,4 +1035,10 @@ class OrderListPage {
   }
 }
 
-module.exports = { OrderListPage, extractPincode };
+module.exports = {
+  OrderListPage,
+  extractPincode,
+  loadExcelCacheForCarrier,
+  getCarrierPincodes,
+  loadExcelCaches,
+};
