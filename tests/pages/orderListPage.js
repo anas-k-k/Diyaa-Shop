@@ -42,6 +42,21 @@ function extractPincode(rawText) {
   return [...new Set(candidates)];
 }
 
+// Extract state from a raw text blob.
+// Returns the state name as a string (e.g. 'Tamil Nadu').
+// Matches formats like 'State : Tamil Nadu', 'State:Tamil Nadu', etc.
+function extractState(rawText) {
+  if (!rawText || typeof rawText !== "string") return null;
+
+  // Look for patterns like 'State *: *value'
+  const stateMatch = rawText.match(/State\s*[:\-]?\s*([^,\n\r]+)/i);
+  if (stateMatch && stateMatch[1]) {
+    return stateMatch[1].trim();
+  }
+
+  return null;
+}
+
 // Read first-column values from the first sheet of an Excel file and return a Set of strings
 function readPincodesFromExcel(absPath) {
   if (!xlsx) return new Set();
@@ -224,13 +239,14 @@ class OrderListPage {
       };
     }
 
-    // try to extract pincode(s) from the raw text and log the main one
+    // try to extract pincode(s) and state from the raw text and log them
     const pincodes = extractPincode(rawText);
     const pincode = pincodes.length ? pincodes[0] : null;
+    const state = extractState(rawText);
 
     // eslint-disable-next-line no-console
     console.log(
-      `Extracted pincode from address popup: ${pincode} (orderId=${
+      `Extracted pincode: ${pincode}, state: ${state} (orderId=${
         orderId || "N/A"
       })`
     );
@@ -263,6 +279,7 @@ class OrderListPage {
       foundAddress: hasAddressChar,
       pincode,
       pincodes,
+      state,
       rawText,
       orderId,
     };
@@ -273,7 +290,13 @@ class OrderListPage {
   // This method is defensive and will return quickly if elements are not found.
   async syncShiprocketForOrder(
     orderId,
-    { waitMs = 2500, pincode = null } = {}
+    {
+      waitMs = 2500,
+      pincode = null,
+      state = null,
+      paymentType = null,
+      paymentStatus = null,
+    } = {}
   ) {
     if (!orderId) return { synced: false, reason: "no-order-id" };
 
@@ -293,7 +316,39 @@ class OrderListPage {
           state: "visible",
           timeout: 4000,
         });
+
+        // Set up dialog handler before clicking the sync button
+        let dialogAppeared = false;
+        const dialogHandler = async (dialog) => {
+          dialogAppeared = true;
+          console.log(
+            `Dialog appeared for order ${orderId}: "${dialog.message()}"`
+          );
+          try {
+            await dialog.dismiss(); // Dismiss the dialog
+          } catch (e) {
+            // ignore dialog dismiss failures
+          }
+        };
+
+        // Listen for any dialog that might appear
+        newPage.once("dialog", dialogHandler);
+
         await newPage.click("#sync_shiprocket");
+
+        // Wait a moment to see if dialog appears
+        await newPage.waitForTimeout(1000);
+
+        // If dialog appeared, skip this row
+        if (dialogAppeared) {
+          console.log(
+            `Skipping order ${orderId} due to dialog appearance. Closing tab and continuing to next row.`
+          );
+          return { synced: false, reason: "dialog-appeared", skipped: true };
+        }
+
+        // Remove the dialog listener if no dialog appeared
+        newPage.removeListener("dialog", dialogHandler);
       } catch (e) {
         // couldn't find or click sync button
         return { synced: false, reason: "no-sync-button" };
@@ -425,6 +480,51 @@ class OrderListPage {
           const carrierOverride = (process.env.CARRIER_OVERRIDE || "").trim();
 
           if (carrierOverride) {
+            // Validate carrier-specific conditions before selection
+            let shouldSelectCarrier = true;
+            let skipReason = "";
+
+            const carrierLower = carrierOverride.toLowerCase();
+            const stateLower = (state || "").toLowerCase();
+            const paymentTypeLower = (paymentType || "").toLowerCase();
+            const paymentStatusLower = (paymentStatus || "").toLowerCase();
+
+            // Condition 1: STCourier validation
+            if (carrierLower === "stcourier") {
+              if (
+                stateLower !== "tamil nadu" ||
+                !paymentTypeLower.includes("prepaid") ||
+                paymentStatusLower !== "success"
+              ) {
+                shouldSelectCarrier = false;
+                skipReason = `STCourier conditions not met: state='${state}' (should be 'Tamil Nadu'), paymentType='${paymentType}' (should contain 'prepaid'), paymentStatus='${paymentStatus}' (should be 'success')`;
+              }
+            }
+
+            // Condition 2: Shiprocket validation
+            if (carrierLower === "shiprocket") {
+              if (
+                stateLower === "tamil nadu" ||
+                paymentStatusLower !== "success"
+              ) {
+                shouldSelectCarrier = false;
+                skipReason = `Shiprocket conditions not met: state='${state}' (should NOT be 'Tamil Nadu'), paymentStatus='${paymentStatus}' (should be 'success')`;
+              }
+            }
+
+            if (!shouldSelectCarrier) {
+              console.log(
+                `Skipping carrier selection for order ${orderId}: ${skipReason}`
+              );
+              // Close the sync popup and return early
+              await this.CloseSyncPopup(newPage);
+              return {
+                synced: false,
+                reason: "carrier-conditions-not-met",
+                skipReason,
+              };
+            }
+
             // Use the exact CARRIER_OVERRIDE value from .env to select from dropdown
             // Pass the pincode from the function parameters for validation
             selected = await trySelectByText(carrierOverride, pincode);
@@ -534,110 +634,118 @@ class OrderListPage {
           // close popup by clicking #SyncClose if present
           await this.CloseSyncPopup(newPage);
 
-          // 3) once the popup is closed, click on fetch button on the main page
-          try {
-            const fetchSel =
-              "body > div.wrapper > div.content-wrapper > section > div.row > div > div.row.col-mb-4 > div:nth-child(3) > div:nth-child(1) > button";
-            await newPage.waitForSelector(fetchSel, {
-              state: "visible",
-              timeout: 5000,
-            });
-            // some actions trigger a native confirmation dialog; accept it if shown
-            newPage.once("dialog", async (dialog) => {
-              try {
-                await dialog.accept();
-              } catch (ee) {
-                // ignore
-              }
-            });
-            await newPage.click(fetchSel);
-            // wait for fetch to run
-            await newPage.waitForTimeout(3000);
-          } catch (e) {
-            // fallback small wait if selector not found
-            await newPage.waitForTimeout(1500);
-          }
-
-          // 4) generate GST invoice if required, then click on save with selector #save_order
-          try {
-            // Click the "Generate" GST button for all carriers if available
+          // Check if CARRIER_OVERRIDE is not "shiprocket" before executing fetch, GST, and save operations
+          const carrierOverride = (process.env.CARRIER_OVERRIDE || "").trim();
+          if (carrierOverride.toLowerCase() !== "shiprocket") {
+            // 3) once the popup is closed, click on fetch button on the main page
             try {
-              // click the generate GST button if visible
-              const genSel = "#gen_gst_invoice";
-              const gstNbSel = "#gst_invoice_nb";
-              const genEl = await newPage
-                .waitForSelector(genSel, {
-                  state: "visible",
-                  timeout: 3000,
-                })
-                .catch(() => null);
-              if (genEl) {
-                // Clicking may trigger a native browser dialog (confirm/alert).
-                // Accept it explicitly to match manual behaviour seen in the UI.
-                newPage.once("dialog", async (dialog) => {
-                  try {
-                    await dialog.accept();
-                  } catch (ee) {
-                    // ignore accept failures
-                  }
-                });
-                console.log(
-                  `GST Invoice Generation Triggered for carrier: ${
-                    selectedCarrier || "Unknown"
-                  }`
-                );
-                // clicking may trigger an async process that sets the value of #gst_invoice_nb
-                await genEl.click().catch(() => {});
-
-                // wait for #gst_invoice_nb to have a non-empty value (up to 8s)
-                const start = Date.now();
-                const timeout = 8000;
-                let populated = false;
-                while (Date.now() - start < timeout) {
-                  try {
-                    const val = await newPage.evaluate((sel) => {
-                      const e = document.querySelector(sel);
-                      return e ? e.value || e.innerText || "" : "";
-                    }, gstNbSel);
-                    if (val && String(val).trim().length) {
-                      populated = true;
-                      break;
-                    }
-                  } catch (ee) {
-                    // ignore evaluation errors and retry
-                  }
-                  // short sleep
-                  await newPage.waitForTimeout(250);
+              const fetchSel =
+                "body > div.wrapper > div.content-wrapper > section > div.row > div > div.row.col-mb-4 > div:nth-child(3) > div:nth-child(1) > button";
+              await newPage.waitForSelector(fetchSel, {
+                state: "visible",
+                timeout: 5000,
+              });
+              // some actions trigger a native confirmation dialog; accept it if shown
+              newPage.once("dialog", async (dialog) => {
+                try {
+                  await dialog.accept();
+                } catch (ee) {
+                  // ignore
                 }
-                // if not populated, continue anyway - non-fatal
-              }
+              });
+              await newPage.click(fetchSel);
+              // wait for fetch to run
+              await newPage.waitForTimeout(3000);
             } catch (e) {
-              // ignore failures in GST generation; proceed to save
+              // fallback small wait if selector not found
+              await newPage.waitForTimeout(1500);
             }
 
-            await newPage.waitForSelector("#save_order", {
-              state: "visible",
-              timeout: 5000,
-            });
-            // accept confirm/alert if the save triggers one
-            newPage.once("dialog", async (dialog) => {
+            // 4) generate GST invoice if required, then click on save with selector #save_order
+            try {
+              // Click the "Generate" GST button for all carriers if available
               try {
-                await dialog.accept();
-              } catch (ee) {
-                // ignore
-              }
-            });
-            await newPage.click("#save_order");
-          } catch (e) {
-            // if save button not found, ignore
-          }
+                // click the generate GST button if visible
+                const genSel = "#gen_gst_invoice";
+                const gstNbSel = "#gst_invoice_nb";
+                const genEl = await newPage
+                  .waitForSelector(genSel, {
+                    state: "visible",
+                    timeout: 3000,
+                  })
+                  .catch(() => null);
+                if (genEl) {
+                  // Clicking may trigger a native browser dialog (confirm/alert).
+                  // Accept it explicitly to match manual behaviour seen in the UI.
+                  newPage.once("dialog", async (dialog) => {
+                    try {
+                      await dialog.accept();
+                    } catch (ee) {
+                      // ignore accept failures
+                    }
+                  });
+                  console.log(
+                    `GST Invoice Generation Triggered for carrier: ${
+                      selectedCarrier || "Unknown"
+                    }`
+                  );
+                  // clicking may trigger an async process that sets the value of #gst_invoice_nb
+                  //await genEl.click().catch(() => {});
 
-          // 5) wait for save to complete — look for save button to become disabled or just wait
-          try {
-            // wait a bit for save operation to complete
-            await newPage.waitForTimeout(3000);
-          } catch (e) {
-            // noop
+                  // wait for #gst_invoice_nb to have a non-empty value (up to 8s)
+                  const start = Date.now();
+                  const timeout = 8000;
+                  let populated = false;
+                  while (Date.now() - start < timeout) {
+                    try {
+                      const val = await newPage.evaluate((sel) => {
+                        const e = document.querySelector(sel);
+                        return e ? e.value || e.innerText || "" : "";
+                      }, gstNbSel);
+                      if (val && String(val).trim().length) {
+                        populated = true;
+                        break;
+                      }
+                    } catch (ee) {
+                      // ignore evaluation errors and retry
+                    }
+                    // short sleep
+                    await newPage.waitForTimeout(250);
+                  }
+                  // if not populated, continue anyway - non-fatal
+                }
+              } catch (e) {
+                // ignore failures in GST generation; proceed to save
+              }
+
+              await newPage.waitForSelector("#save_order", {
+                state: "visible",
+                timeout: 5000,
+              });
+              // accept confirm/alert if the save triggers one
+              newPage.once("dialog", async (dialog) => {
+                try {
+                  await dialog.accept();
+                } catch (ee) {
+                  // ignore
+                }
+              });
+              await newPage.click("#save_order");
+            } catch (e) {
+              // if save button not found, ignore
+            }
+
+            // 5) wait for save to complete — look for save button to become disabled or just wait
+            try {
+              // wait a bit for save operation to complete
+              await newPage.waitForTimeout(3000);
+            } catch (e) {
+              // noop
+            }
+          } else {
+            console.log(
+              "Skipping fetch, GST generation, and save operations for Shiprocket carrier"
+            );
           }
         }
       } catch (e) {
@@ -694,7 +802,32 @@ class OrderListPage {
   async clickEachRowAddressPopup({ perRowTimeout = 5000 } = {}) {
     await this.waitForTable();
     // get all rows currently in the table
-    const rows = await this.page.$$(`${this.tableSelector} tbody tr`);
+    const allRows = await this.page.$$(`${this.tableSelector} tbody tr`);
+
+    // Filter rows to only include those with "New" badge
+    const rows = [];
+    for (const row of allRows) {
+      try {
+        // Check if this row has a "New" badge in the Name column (second column)
+        const nameCell = await row.$("td:nth-child(2)");
+        if (nameCell) {
+          const badgeText = await nameCell
+            .$eval(".badge", (el) => el.textContent.trim())
+            .catch(() => null);
+          if (badgeText === "New") {
+            rows.push(row);
+          }
+        }
+      } catch (e) {
+        // If we can't check the badge, skip this row
+        continue;
+      }
+    }
+
+    // Log filtering results
+    console.log(`Total rows in table: ${allRows.length}`);
+    console.log(`Rows with "New" badge: ${rows.length}`);
+
     // If PROCESS_COUNT env var is set to a positive integer, treat it as
     // the maximum number of rows to process in this run. Otherwise process
     // all rows as before.
@@ -704,19 +837,22 @@ class OrderListPage {
     if (maxToProcess) {
       // eslint-disable-next-line no-console
       console.log(
-        `PROCESS_COUNT set: will process at most ${maxToProcess} rows`
+        `PROCESS_COUNT set: will stop after ${maxToProcess} successful records or end of table (whichever comes first)`
       );
     }
-    // counter for how many rows we've actually processed (click + handle)
-    let processedRowCount = 0;
+    // counter for how many rows we've successfully processed
+    let successfullyProcessedCount = 0;
+    let totalRowsAttempted = 0; // Track total rows attempted
     const processed = new Map(); // Use Map to store carrier -> orders dynamically
     const errors = []; // Array to store orders that had errors during processing
     for (let i = 0; i < rows.length; i++) {
-      // stop early if we've reached the PROCESS_COUNT limit
-      if (maxToProcess && processedRowCount >= maxToProcess) {
+      totalRowsAttempted = i + 1; // Update the count as we process each row
+      // stop early if we've reached the PROCESS_COUNT limit for successful records
+      // or if we've reached the end of all records
+      if (maxToProcess && successfullyProcessedCount >= maxToProcess) {
         // eslint-disable-next-line no-console
         console.log(
-          `Reached PROCESS_COUNT limit (${maxToProcess}), stopping further processing.`
+          `Reached PROCESS_COUNT limit (${maxToProcess}) for successful records, stopping further processing.`
         );
         break;
       }
@@ -725,6 +861,9 @@ class OrderListPage {
         // Attempt to extract an order id from the address button cell first
         // Selector pattern used by the UI: `#example > tbody > tr:nth-child(1) > td.sorting_1 > button.btn.btn-link.address-show-btn`
         let orderId = null;
+        let paymentType = null;
+        let paymentStatus = null;
+
         try {
           const addrBtn = await row.$(
             "td.sorting_1 > button.address-show-btn, td.sorting_1 > a.address-show-btn"
@@ -795,6 +934,28 @@ class OrderListPage {
             }
           }
         }
+
+        // Extract Payment Type and Payment Status from table cells
+        // Based on the HTML structure: Payment Type is column 9 (index 8), Payment Status is column 10 (index 9)
+        try {
+          const allCells = await row.$$("td");
+          if (allCells.length >= 10) {
+            // Payment Type is at index 8 (9th column)
+            try {
+              paymentType = (await allCells[8].innerText()).trim();
+            } catch (e) {
+              // ignore
+            }
+            // Payment Status is at index 9 (10th column)
+            try {
+              paymentStatus = (await allCells[9].innerText()).trim();
+            } catch (e) {
+              // ignore
+            }
+          }
+        } catch (e) {
+          // ignore table cell extraction errors
+        }
         // If ORDERS_TO_PROCESS is non-empty, only process rows whose
         // orderId is listed there. Otherwise process all orders.
         if (ORDERS_TO_PROCESS.size > 0) {
@@ -845,9 +1006,13 @@ class OrderListPage {
           // ignore errors from the delegated handler and continue with local logic
         }
 
+        // Track whether this row was successfully processed
+        let rowProcessedSuccessfully = false;
+
         // If we extracted a pincode and have an orderId, attempt to sync via Shiprocket in a new tab.
         try {
           const pincode = handleResult && handleResult.pincode;
+          const state = handleResult && handleResult.state;
           if (pincode && orderId) {
             // run sync flow for this order; keep it quick and non-blocking per row
             // awaiting here ensures sequential per-row behavior; if you want parallel,
@@ -855,29 +1020,34 @@ class OrderListPage {
             const result = await this.syncShiprocketForOrder(orderId, {
               waitMs: 2500,
               pincode,
+              state,
+              paymentType,
+              paymentStatus,
             });
 
             // Check if sync was successful
             if (result && result.synced) {
               try {
-                // Prefer the carrier returned by the sync flow if present
-                let carrier = result.carrier;
-
-                // If sync didn't return a carrier, use the CARRIER_OVERRIDE value directly
-                if (!carrier) {
-                  const carrierOverride = (
-                    process.env.CARRIER_OVERRIDE || ""
-                  ).trim();
-                  if (carrierOverride) {
-                    carrier = carrierOverride; // Use the exact value from .env
-                  }
-                }
+                // Always use CARRIER_OVERRIDE as the definitive carrier name
+                // This ensures consistency regardless of what the sync operation returns
+                const carrierOverride = (
+                  process.env.CARRIER_OVERRIDE || ""
+                ).trim();
+                let carrier = carrierOverride || result.carrier;
 
                 if (carrier) {
                   if (!processed.has(carrier)) {
                     processed.set(carrier, []);
                   }
-                  processed.get(carrier).push({ orderId, pincode });
+                  processed.get(carrier).push({
+                    orderId,
+                    pincode,
+                    state: (handleResult && handleResult.state) || "N/A",
+                    paymentType: paymentType || "N/A",
+                    paymentStatus: paymentStatus || "N/A",
+                  });
+                  // Mark as successfully processed since we have a carrier and sync succeeded
+                  rowProcessedSuccessfully = true;
                 } else {
                   // No carrier identified but sync was successful - add to errors for investigation
                   errors.push({
@@ -885,6 +1055,7 @@ class OrderListPage {
                     pincode,
                     error: "Sync successful but no carrier identified",
                   });
+                  // Don't mark as successful since no carrier was identified
                 }
               } catch (e) {
                 // Error processing successful sync result
@@ -893,18 +1064,51 @@ class OrderListPage {
                   pincode,
                   error: `Error processing sync result: ${e.message}`,
                 });
+                // Don't mark as successful due to error
               }
             } else {
-              // Sync failed - add to errors
+              // Sync failed - check if it was due to dialog appearance
               const errorReason = result
                 ? result.reason
                 : "Unknown sync failure";
-              errors.push({
-                orderId,
-                pincode,
-                error: `Sync failed: ${errorReason}`,
-              });
+              const skipReason =
+                result && result.skipReason ? ` - ${result.skipReason}` : "";
+
+              // Special handling for dialog-appeared case
+              if (result && result.reason === "dialog-appeared") {
+                console.log(
+                  `Row ${
+                    i + 1
+                  } (Order ID: ${orderId}) - Skipped due to browser dialog. Pincode: ${pincode}, State: ${
+                    state || "N/A"
+                  }, Payment Type: ${paymentType || "N/A"}, Payment Status: ${
+                    paymentStatus || "N/A"
+                  }`
+                );
+                errors.push({
+                  orderId,
+                  pincode,
+                  error: `Skipped due to browser dialog appearance`,
+                  state: state || "N/A",
+                  paymentType: paymentType || "N/A",
+                  paymentStatus: paymentStatus || "N/A",
+                });
+              } else {
+                errors.push({
+                  orderId,
+                  pincode,
+                  error: `Sync failed: ${errorReason}${skipReason}`,
+                });
+              }
+              // Don't mark as successful since sync failed
             }
+          } else {
+            // Missing pincode or orderId - add to errors
+            errors.push({
+              orderId: orderId || "Unknown",
+              pincode: (handleResult && handleResult.pincode) || "Unknown",
+              error: "Missing pincode or order ID for processing",
+            });
           }
         } catch (e) {
           // Exception during sync attempt - add to errors
@@ -922,6 +1126,7 @@ class OrderListPage {
         // Per-row logging so user sees immediate progress for each processed row
         try {
           const pcode = (handleResult && handleResult.pincode) || null;
+          const state = (handleResult && handleResult.state) || null;
           // determine carrier if we recorded it in processed arrays
           let carrier = null;
           for (const [carrierName, orders] of processed) {
@@ -934,23 +1139,37 @@ class OrderListPage {
           console.log(
             `Row ${i + 1}: order=${orderId || "N/A"}, pincode=${
               pcode || "N/A"
-            }, carrier=${carrier || "N/A"}`
+            }, state=${state || "N/A"}, paymentType=${
+              paymentType || "N/A"
+            }, paymentStatus=${paymentStatus || "N/A"}, carrier=${
+              carrier || "N/A"
+            }`
           );
         } catch (e) {
           // ignore logging errors per row
         }
 
-        // short pause before next row to stabilize DOM
-        // increment processed counter only for rows that actually reached
-        // this point (i.e. were clicked and handled)
-        try {
-          processedRowCount += 1;
-        } catch (e) {
-          // ignore
+        // Only increment counter for successfully processed rows
+        if (rowProcessedSuccessfully) {
+          try {
+            successfullyProcessedCount += 1;
+          } catch (e) {
+            // ignore
+          }
+
+          // Check if we've reached the configured maximum successful records
+          if (maxToProcess && successfullyProcessedCount >= maxToProcess) {
+            // eslint-disable-next-line no-console
+            console.log(
+              `Reached PROCESS_COUNT limit (${maxToProcess}) for successful records after row ${
+                i + 1
+              }. Stopping processing.`
+            );
+            break;
+          }
         }
 
-        // if we've reached the configured maximum, break out early
-        if (maxToProcess && processedRowCount >= maxToProcess) break;
+        // short pause before next row to stabilize DOM
 
         await this.page.waitForTimeout(200);
       } catch (e) {
@@ -962,6 +1181,38 @@ class OrderListPage {
     }
     // After processing all rows, print a summary and write it to logs
     try {
+      // Calculate totals
+      let totalSuccessful = 0;
+      for (const ordersList of processed.values()) {
+        totalSuccessful += ordersList.length;
+      } // Print processing summary
+      console.log(`\nPROCESSING SUMMARY`);
+      console.log("================================");
+      console.log(`Total rows attempted: ${totalRowsAttempted}`);
+      console.log(`Successfully processed: ${totalSuccessful}`);
+      console.log(`Errors/Skipped: ${errors.length}`);
+      if (maxToProcess) {
+        console.log(`PROCESS_COUNT limit: ${maxToProcess}`);
+        console.log(
+          `Limit reached: ${totalSuccessful >= maxToProcess ? "YES" : "NO"}`
+        );
+      }
+
+      // Print consolidated summary of all successful orders
+      if (totalSuccessful > 0) {
+        console.log(`\nSUCCESSFUL ORDERS SUMMARY (${totalSuccessful})`);
+        console.log("============================================");
+        let orderIndex = 1;
+        for (const [carrierName, ordersList] of processed) {
+          for (const item of ordersList) {
+            console.log(
+              `${orderIndex}. Order: ${item.orderId} | Pincode: ${item.pincode} | State: ${item.state} | Payment: ${item.paymentType} | Status: ${item.paymentStatus} | Carrier: ${carrierName}`
+            );
+            orderIndex++;
+          }
+        }
+      }
+
       // Print summary for each carrier dynamically (successful processing only)
       for (const [carrierName, ordersList] of processed) {
         console.log(`\nProcessed on ${carrierName} (${ordersList.length})`);
@@ -969,22 +1220,53 @@ class OrderListPage {
         for (let i = 0; i < ordersList.length; i++) {
           const item = ordersList[i];
           console.log(
-            `${i + 1}. Order :${item.orderId}, Pincode: ${item.pincode}`
+            `${i + 1}. Order: ${item.orderId}, Pincode: ${
+              item.pincode
+            }, State: ${item.state}, Payment Type: ${
+              item.paymentType
+            }, Payment Status: ${item.paymentStatus}`
           );
         }
       }
 
       // Print errors section if there are any
       if (errors.length > 0) {
-        console.log(`\nProcessing Errors (${errors.length})`);
-        console.log("--------------------------------");
-        for (let i = 0; i < errors.length; i++) {
-          const item = errors[i];
+        // Separate dialog-skipped rows from other errors
+        const dialogSkipped = errors.filter((e) =>
+          e.error.includes("browser dialog")
+        );
+        const otherErrors = errors.filter(
+          (e) => !e.error.includes("browser dialog")
+        );
+
+        if (dialogSkipped.length > 0) {
           console.log(
-            `${i + 1}. Order :${item.orderId}, Pincode: ${
-              item.pincode
-            }, Error: ${item.error}`
+            `\nSkipped due to Browser Dialog (${dialogSkipped.length})`
           );
+          console.log("--------------------------------------------------");
+          for (let i = 0; i < dialogSkipped.length; i++) {
+            const item = dialogSkipped[i];
+            console.log(
+              `${i + 1}. Order: ${item.orderId}, Pincode: ${
+                item.pincode
+              }, State: ${item.state || "N/A"}, Payment Type: ${
+                item.paymentType || "N/A"
+              }, Payment Status: ${item.paymentStatus || "N/A"}`
+            );
+          }
+        }
+
+        if (otherErrors.length > 0) {
+          console.log(`\nProcessing Errors (${otherErrors.length})`);
+          console.log("--------------------------------");
+          for (let i = 0; i < otherErrors.length; i++) {
+            const item = otherErrors[i];
+            console.log(
+              `${i + 1}. Order: ${item.orderId}, Pincode: ${
+                item.pincode
+              }, Error: ${item.error}`
+            );
+          }
         }
       }
 
@@ -996,6 +1278,42 @@ class OrderListPage {
         const filename = path.join(logsDir, `summary-${ts}.txt`);
         const lines = [];
 
+        // Calculate totals for log file
+        let totalSuccessful = 0;
+        for (const ordersList of processed.values()) {
+          totalSuccessful += ordersList.length;
+        }
+
+        // Write processing summary to log
+        lines.push("PROCESSING SUMMARY");
+        lines.push("================================");
+        lines.push(`Total rows attempted: ${totalRowsAttempted}`);
+        lines.push(`Successfully processed: ${totalSuccessful}`);
+        lines.push(`Errors/Skipped: ${errors.length}`);
+        if (maxToProcess) {
+          lines.push(`PROCESS_COUNT limit: ${maxToProcess}`);
+          lines.push(
+            `Limit reached: ${totalSuccessful >= maxToProcess ? "YES" : "NO"}`
+          );
+        }
+        lines.push(""); // Add empty line
+
+        // Write consolidated summary of all successful orders to log
+        if (totalSuccessful > 0) {
+          lines.push(`SUCCESSFUL ORDERS SUMMARY (${totalSuccessful})`);
+          lines.push("============================================");
+          let orderIndex = 1;
+          for (const [carrierName, ordersList] of processed) {
+            for (const item of ordersList) {
+              lines.push(
+                `${orderIndex}. Order: ${item.orderId} | Pincode: ${item.pincode} | State: ${item.state} | Payment: ${item.paymentType} | Status: ${item.paymentStatus} | Carrier: ${carrierName}`
+              );
+              orderIndex++;
+            }
+          }
+          lines.push(""); // Add empty line
+        }
+
         // Write summary for each carrier dynamically (successful processing only)
         for (const [carrierName, ordersList] of processed) {
           lines.push(`Processed on ${carrierName} (${ordersList.length})`);
@@ -1003,7 +1321,11 @@ class OrderListPage {
           for (let i = 0; i < ordersList.length; i++) {
             const item = ordersList[i];
             lines.push(
-              `${i + 1}. Order :${item.orderId}, Pincode: ${item.pincode}`
+              `${i + 1}. Order: ${item.orderId}, Pincode: ${
+                item.pincode
+              }, State: ${item.state}, Payment Type: ${
+                item.paymentType
+              }, Payment Status: ${item.paymentStatus}`
             );
           }
           lines.push(""); // Add empty line between carriers
@@ -1011,17 +1333,45 @@ class OrderListPage {
 
         // Write errors section if there are any
         if (errors.length > 0) {
-          lines.push(`Processing Errors (${errors.length})`);
-          lines.push("--------------------------------");
-          for (let i = 0; i < errors.length; i++) {
-            const item = errors[i];
+          // Separate dialog-skipped rows from other errors in log file too
+          const dialogSkipped = errors.filter((e) =>
+            e.error.includes("browser dialog")
+          );
+          const otherErrors = errors.filter(
+            (e) => !e.error.includes("browser dialog")
+          );
+
+          if (dialogSkipped.length > 0) {
             lines.push(
-              `${i + 1}. Order :${item.orderId}, Pincode: ${
-                item.pincode
-              }, Error: ${item.error}`
+              `Skipped due to Browser Dialog (${dialogSkipped.length})`
             );
+            lines.push("--------------------------------------------------");
+            for (let i = 0; i < dialogSkipped.length; i++) {
+              const item = dialogSkipped[i];
+              lines.push(
+                `${i + 1}. Order: ${item.orderId}, Pincode: ${
+                  item.pincode
+                }, State: ${item.state || "N/A"}, Payment Type: ${
+                  item.paymentType || "N/A"
+                }, Payment Status: ${item.paymentStatus || "N/A"}`
+              );
+            }
+            lines.push(""); // Add empty line
           }
-          lines.push(""); // Add empty line after errors
+
+          if (otherErrors.length > 0) {
+            lines.push(`Processing Errors (${otherErrors.length})`);
+            lines.push("--------------------------------");
+            for (let i = 0; i < otherErrors.length; i++) {
+              const item = otherErrors[i];
+              lines.push(
+                `${i + 1}. Order: ${item.orderId}, Pincode: ${
+                  item.pincode
+                }, Error: ${item.error}`
+              );
+            }
+            lines.push(""); // Add empty line after errors
+          }
         }
 
         fs.writeFileSync(filename, lines.join("\n"));
@@ -1030,7 +1380,9 @@ class OrderListPage {
         // ignore file write errors
       }
     } catch (e) {
-      // ignore logging errors
+      // Log the error instead of ignoring it completely
+      console.error("Error in summary generation:", e.message);
+      console.error("Stack trace:", e.stack);
     }
   }
 }
@@ -1038,6 +1390,7 @@ class OrderListPage {
 module.exports = {
   OrderListPage,
   extractPincode,
+  extractState,
   loadExcelCacheForCarrier,
   getCarrierPincodes,
   loadExcelCaches,
