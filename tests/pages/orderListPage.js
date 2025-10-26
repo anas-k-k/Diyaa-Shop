@@ -503,12 +503,22 @@ class OrderListPage {
 
             // Condition 2: Shiprocket validation
             if (carrierLower === "shiprocket") {
-              if (
-                stateLower === "tamil nadu" ||
-                paymentStatusLower !== "success"
-              ) {
+              // Shiprocket is eligible if:
+              // (Any State AND COD AND Success) OR (Prepaid AND NOT Tamil Nadu AND Success)
+              const isCODWithSuccess =
+                paymentTypeLower.includes("cod") &&
+                paymentStatusLower === "success";
+              const isPrepaidNotTamilNaduWithSuccess =
+                paymentTypeLower.includes("prepaid") &&
+                stateLower !== "tamil nadu" &&
+                paymentStatusLower === "success";
+
+              const isEligible =
+                isCODWithSuccess || isPrepaidNotTamilNaduWithSuccess;
+
+              if (!isEligible) {
                 shouldSelectCarrier = false;
-                skipReason = `Shiprocket conditions not met: state='${state}' (should NOT be 'Tamil Nadu'), paymentStatus='${paymentStatus}' (should be 'success')`;
+                skipReason = `Shiprocket conditions not met: Either (COD + Success) or (Prepaid + NOT Tamil Nadu + Success) required. Current: state='${state}', paymentType='${paymentType}', paymentStatus='${paymentStatus}'`;
               }
             }
 
@@ -663,61 +673,6 @@ class OrderListPage {
 
             // 4) generate GST invoice if required, then click on save with selector #save_order
             try {
-              // Click the "Generate" GST button for all carriers if available
-              try {
-                // click the generate GST button if visible
-                const genSel = "#gen_gst_invoice";
-                const gstNbSel = "#gst_invoice_nb";
-                const genEl = await newPage
-                  .waitForSelector(genSel, {
-                    state: "visible",
-                    timeout: 3000,
-                  })
-                  .catch(() => null);
-                if (genEl) {
-                  // Clicking may trigger a native browser dialog (confirm/alert).
-                  // Accept it explicitly to match manual behaviour seen in the UI.
-                  newPage.once("dialog", async (dialog) => {
-                    try {
-                      await dialog.accept();
-                    } catch (ee) {
-                      // ignore accept failures
-                    }
-                  });
-                  console.log(
-                    `GST Invoice Generation Triggered for carrier: ${
-                      selectedCarrier || "Unknown"
-                    }`
-                  );
-                  // clicking may trigger an async process that sets the value of #gst_invoice_nb
-                  //await genEl.click().catch(() => {});
-
-                  // wait for #gst_invoice_nb to have a non-empty value (up to 8s)
-                  const start = Date.now();
-                  const timeout = 8000;
-                  let populated = false;
-                  while (Date.now() - start < timeout) {
-                    try {
-                      const val = await newPage.evaluate((sel) => {
-                        const e = document.querySelector(sel);
-                        return e ? e.value || e.innerText || "" : "";
-                      }, gstNbSel);
-                      if (val && String(val).trim().length) {
-                        populated = true;
-                        break;
-                      }
-                    } catch (ee) {
-                      // ignore evaluation errors and retry
-                    }
-                    // short sleep
-                    await newPage.waitForTimeout(250);
-                  }
-                  // if not populated, continue anyway - non-fatal
-                }
-              } catch (e) {
-                // ignore failures in GST generation; proceed to save
-              }
-
               await newPage.waitForSelector("#save_order", {
                 state: "visible",
                 timeout: 5000,
